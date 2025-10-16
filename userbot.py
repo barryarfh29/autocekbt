@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Userbot - Link-only manager dengan:
-- auto-fix link input & auto-verify on /addchan (terbatas)
-- robust /check (text, caption, entities, buttons)
-- /join untuk invite + public
-- anti-flood: adaptive delay, jitter, batching, cooldown
-- governor: hourly/daily caps + FloodWait abort policy
-- status updates during /join, /verifychan, /check
-- SESSION_STRING via ENV (siap untuk Easypanel)
+Userbot - Link-only manager
+- Auto-fix link input & auto-verify
+- Robust /check (text, caption, entities, buttons)
+- /join for invite + public
+- Anti-flood, batching, cooldown, governor caps
+- SESSION_STRING via ENV (ideal untuk Easypanel)
+- Storage pluggable: FILES (default) atau MongoDB (STORAGE=mongo)
 """
 
 import os
@@ -29,89 +28,165 @@ from pyrogram.errors import (
     UserAlreadyParticipant,
 )
 
-# ==================== KONFIGURASI DASAR (ENV) ====================
+# ==================== ENV & RUNTIME ====================
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 PHONE = (os.getenv("PHONE", "") or "").strip()
 
-CHANNEL_FILE = "channels.txt"
-LINK_FILE = "links.txt"
-CACHE_FILE = "channels_cache.json"
+# Storage selector: "files" (default) atau "mongo"
+STORAGE = os.getenv("STORAGE", "files").lower()
 
-# ---- Anti Flood (runtime configurable via commands) ----
-JOIN_DELAY = 12                # baseline jeda antar join (detik)
-BATCH_SIZE = 6                 # maks join per batch
-BATCH_COOLDOWN = 25 * 60       # cooldown antar batch (detik)
-CHECK_LIMIT = 30               # default pesan per channel saat /check
-STATUS_INTERVAL = 5            # update status tiap N item
+# DATA_DIR untuk mode files; default:
+# - jika SESSION_STRING ada (umumnya di server) -> /data
+# - jika tidak, simpan di folder lokal project (.)
+DATA_DIR = os.getenv("DATA_DIR", "/data" if SESSION_STRING else ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# ---- Governor (kuota nyata agar terhindar Flood besar) ----
-HOURLY_JOIN_CAP = 8           # maks join per 60 menit
-DAILY_JOIN_CAP  = 40          # maks join per 24 jam
-FLOOD_ABORT_SECONDS = 600     # FloodWait >= ini -> hentikan batch & cooldown panjang
+def _p(*names):  # helper path
+    return os.path.join(DATA_DIR, *names)
 
-# Lainnya
-MAX_AUTOVERIFY_PER_ADD = 6    # saat /addchan auto-verify hanya proses N link pertama
+# Nama “file/kind” yang dipakai call-site (tidak perlu diubah di handlers)
+CHANNEL_FILE = _p("channels.txt")
+LINK_FILE    = _p("links.txt")
+CACHE_FILE   = _p("channels_cache.json")
 
-# runtime adaptive
+# Anti Flood (bisa diubah runtime via commands)
+JOIN_DELAY = 12
+BATCH_SIZE = 6
+BATCH_COOLDOWN = 25 * 60
+CHECK_LIMIT = 30
+STATUS_INTERVAL = 5
+HOURLY_JOIN_CAP = 8
+DAILY_JOIN_CAP = 40
+FLOOD_ABORT_SECONDS = 600
+MAX_AUTOVERIFY_PER_ADD = 6
+
 adaptive_delay = JOIN_DELAY
 join_timestamps = deque(maxlen=DAILY_JOIN_CAP * 2)
 
-
-# ---------- FILE UTILITIES ----------
-def load_lines(path: str) -> List[str]:
-    if not os.path.exists(path):
-        return []
+# ==================== STORAGE LAYER (FILES / MONGO) ====================
+def _load_lines_file(path):
+    if not os.path.exists(path): return []
     with open(path, "r", encoding="utf-8") as f:
         return [x.strip() for x in f if x.strip()]
 
-def save_lines(path: str, lines: List[str]):
+def _save_lines_file(path, lines):
     lines = sorted(set([x.strip() for x in lines if x.strip()]))
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-def load_cache() -> Dict[str, dict]:
-    if not os.path.exists(CACHE_FILE):
-        return {}
+def _load_cache_file():
+    if not os.path.exists(CACHE_FILE): return {}
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-def save_cache(cache: Dict[str, dict]):
+def _save_cache_file(cache: dict):
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
+# --- Mongo backend (opsional) ---
+_mongo_enabled = False
+if STORAGE == "mongo":
+    try:
+        from pymongo import MongoClient, ASCENDING
+        MONGO_URI = os.getenv("MONGO_URI")
+        MONGO_DB  = os.getenv("MONGO_DB", "userbot")
+        if not MONGO_URI:
+            raise RuntimeError("STORAGE=mongo tapi MONGO_URI tidak di-set.")
+        _client = MongoClient(MONGO_URI)
+        _db = _client[MONGO_DB]
+        col_channels = _db["channels"]
+        col_links    = _db["targets"]
+        col_cache    = _db["cache"]
+        # index unik untuk rapi & anti-duplicate
+        col_channels.create_index([("value", ASCENDING)], unique=True)
+        col_links.create_index([("value", ASCENDING)], unique=True)
+        col_cache.create_index([("key", ASCENDING)], unique=True)
+        _mongo_enabled = True
+    except Exception as e:
+        # fallback ke files bila Mongo gagal init
+        print(f"[WARN] Mongo init error: {e}. Fallback ke files storage.")
+        STORAGE = "files"
 
-# ---------- LINK UTILITIES ----------
-TME_ANY_RE = re.compile(r"(?:https?://)?t\.me/.+", re.IGNORECASE)
-INV_PLUS_RE = re.compile(r"^(?:https?://)?t\.me/\+([A-Za-z0-9_-]+)$", re.IGNORECASE)
-INV_JOIN_RE = re.compile(r"^(?:https?://)?t\.me/joinchat/([A-Za-z0-9_-]+)$", re.IGNORECASE)
-PUB_USER_RE = re.compile(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{3,})$", re.IGNORECASE)
-PUB_POST_RE = re.compile(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{3,})/\d+$", re.IGNORECASE)
+def _load_lines_mongo(col):
+    return [d["value"] for d in col.find({}, {"_id": 0, "value": 1})]
+
+def _save_lines_mongo(col, lines):
+    lines = sorted(set([x.strip() for x in lines if x.strip()]))
+    current = set(_load_lines_mongo(col))
+    newset = set(lines)
+    remove = current - newset
+    add = newset - current
+    if remove:
+        col.delete_many({"value": {"$in": list(remove)}})
+    if add:
+        col.insert_many([{"value": v} for v in add])
+
+def _load_cache_mongo():
+    out = {}
+    for d in col_cache.find({}, {"_id": 0, "key": 1, "value": 1}):
+        out[d["key"]] = d["value"]
+    return out
+
+def _save_cache_mongo(cache: dict):
+    for k, v in cache.items():
+        col_cache.update_one({"key": k}, {"$set": {"value": v}}, upsert=True)
+
+# --- Public API dipakai seluruh kode ---
+def load_lines(kind_path: str) -> List[str]:
+    if STORAGE == "mongo" and _mongo_enabled:
+        if kind_path == CHANNEL_FILE: return _load_lines_mongo(col_channels)
+        if kind_path == LINK_FILE:    return _load_lines_mongo(col_links)
+        raise ValueError("Unknown lines kind for mongo")
+    # files
+    if kind_path == CHANNEL_FILE: return _load_lines_file(CHANNEL_FILE)
+    if kind_path == LINK_FILE:    return _load_lines_file(LINK_FILE)
+    return _load_lines_file(kind_path)
+
+def save_lines(kind_path: str, lines: List[str]):
+    if STORAGE == "mongo" and _mongo_enabled:
+        if kind_path == CHANNEL_FILE: return _save_lines_mongo(col_channels, lines)
+        if kind_path == LINK_FILE:    return _save_lines_mongo(col_links, lines)
+        raise ValueError("Unknown lines kind for mongo")
+    # files
+    if kind_path == CHANNEL_FILE: return _save_lines_file(CHANNEL_FILE, lines)
+    if kind_path == LINK_FILE:    return _save_lines_file(LINK_FILE, lines)
+    return _save_lines_file(kind_path, lines)
+
+def load_cache() -> Dict[str, dict]:
+    if STORAGE == "mongo" and _mongo_enabled: return _load_cache_mongo()
+    return _load_cache_file()
+
+def save_cache(cache: Dict[str, dict]):
+    if STORAGE == "mongo" and _mongo_enabled: return _save_cache_mongo(cache)
+    return _save_cache_file(cache)
+
+# ==================== LINK & MESSAGE PARSING ====================
+TME_ANY_RE   = re.compile(r"(?:https?://)?t\.me/.+", re.IGNORECASE)
+INV_PLUS_RE  = re.compile(r"^(?:https?://)?t\.me/\+([A-Za-z0-9_-]+)$", re.IGNORECASE)
+INV_JOIN_RE  = re.compile(r"^(?:https?://)?t\.me/joinchat/([A-Za-z0-9_-]+)$", re.IGNORECASE)
+PUB_USER_RE  = re.compile(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{3,})$", re.IGNORECASE)
+PUB_POST_RE  = re.compile(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{3,})/\d+$", re.IGNORECASE)
 BARE_USER_RE = re.compile(r"^@?([A-Za-z0-9_]{3,})$")
 
 URL_TME_RE = re.compile(r"(?:https?://)?t\.me/[^\s\)\]\}\,]+", re.IGNORECASE)
 AT_USER_RE = re.compile(r"(?<!\w)@([A-Za-z0-9_]{3,})(?!\w)")
 
 def normalize_tme_link(s: str) -> str:
-    """Normalize various raw inputs to canonical https://t.me/username or https://t.me/+invite"""
     if not s: return ""
     s = s.strip().strip(" \t\n\r\"'<>").rstrip(".,;:)]}»\"'")
     s = re.sub(r"\s+", "", s)
     if s.lower().startswith("https://@") or s.lower().startswith("http://@"):
         s = s[s.find("@"):]
     m = BARE_USER_RE.match(s)
-    if s.startswith("@") and m:
-        return f"https://t.me/{m.group(1)}"
-    if m and not s.lower().startswith("http"):
-        return f"https://t.me/{m.group(1)}"
-    if s.lower().startswith("t.me/"):
-        s = "https://" + s
-    if not s.lower().startswith("http"):
-        s = "https://" + s
+    if s.startswith("@") and m:              return f"https://t.me/{m.group(1)}"
+    if m and not s.lower().startswith("http"): return f"https://t.me/{m.group(1)}"
+    if s.lower().startswith("t.me/"):        s = "https://" + s
+    if not s.lower().startswith("http"):     s = "https://" + s
     s = s.replace("t.me//", "t.me/")
     if s.endswith("/"): s = s[:-1]
     return s
@@ -122,21 +197,14 @@ def is_tme_link(s: str) -> bool:
 def is_invite_link(s: str) -> bool:
     return bool(INV_PLUS_RE.match(s) or INV_JOIN_RE.match(s))
 
-def extract_invite_code(s: str) -> Optional[str]:
-    m = INV_PLUS_RE.match(s) or INV_JOIN_RE.match(s)
-    return m.group(1) if m else None
-
 def extract_public_username(s: str) -> Optional[str]:
     s = s.strip()
     m = PUB_USER_RE.match(s) or PUB_POST_RE.match(s)
     return m.group(1) if m else None
 
-
-# ---------- MESSAGE LINK EXTRACTION (text, caption, entities, buttons) ----------
 def normalize_tme_text_link(s: str) -> str:
     s = s.strip().rstrip(".,;:)]}»\"'")
-    if s.lower().startswith("t.me/"):
-        s = "https://" + s
+    if s.lower().startswith("t.me/"): s = "https://" + s
     s = s.replace("t.me//", "t.me/")
     if s.endswith("/"): s = s[:-1]
     return s
@@ -156,8 +224,7 @@ def links_from_entities(msg) -> List[str]:
         t = getattr(e, "type", None)
         if t and t.name == "TEXT_LINK":
             url = getattr(e, "url", "")
-            if "t.me/" in url:
-                out.append(normalize_tme_text_link(url))
+            if "t.me/" in url: out.append(normalize_tme_text_link(url))
         elif t and t.name == "URL":
             try:
                 s = txt[e.offset:e.offset+e.length]
@@ -170,13 +237,11 @@ def links_from_entities(msg) -> List[str]:
 def links_from_buttons(msg) -> List[str]:
     out = []
     rm = getattr(msg, "reply_markup", None)
-    if not rm or not getattr(rm, "inline_keyboard", None):
-        return out
+    if not rm or not getattr(rm, "inline_keyboard", None): return out
     for row in rm.inline_keyboard:
         for btn in row:
             url = getattr(btn, "url", None)
-            if url and "t.me/" in url:
-                out.append(normalize_tme_text_link(url))
+            if url and "t.me/" in url: out.append(normalize_tme_text_link(url))
     return out
 
 def get_all_tme_links(msg) -> List[str]:
@@ -193,8 +258,7 @@ def get_all_tme_links(msg) -> List[str]:
             seen.add(n); out.append(n)
     return out
 
-
-# ---------- DELAY & STATUS HELPERS ----------
+# ==================== DELAY / STATUS / GOVERNOR ====================
 async def human_sleep(base: Optional[float] = None):
     global adaptive_delay
     base = base or adaptive_delay
@@ -210,8 +274,6 @@ async def update_status(msg, text: str):
         except Exception:
             pass
 
-
-# ---------- GOVERNOR HELPERS ----------
 def _prune_old():
     now = time.time()
     while join_timestamps and now - join_timestamps[0] > 24*3600:
@@ -221,17 +283,14 @@ def quota_allows_join() -> Tuple[bool, str]:
     _prune_old()
     now = time.time()
     last_hour = [t for t in join_timestamps if now - t <= 3600]
-    if len(last_hour) >= HOURLY_JOIN_CAP:
-        return False, "hour"
-    if len(join_timestamps) >= DAILY_JOIN_CAP:
-        return False, "day"
+    if len(last_hour) >= HOURLY_JOIN_CAP: return False, "hour"
+    if len(join_timestamps) >= DAILY_JOIN_CAP: return False, "day"
     return True, ""
 
-
-# ---------- CLIENT INIT (support SESSION_STRING) ----------
+# ==================== CLIENT INIT (SESSION_STRING) ====================
 if SESSION_STRING:
     app = Client(
-        name=":memory:",                 # tidak menulis .session ke disk
+        name=":memory:",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING
@@ -244,8 +303,7 @@ else:
         phone_number=PHONE
     )
 
-
-# ==================== COMMANDS: help & runtime settings ====================
+# ==================== COMMANDS ====================
 @app.on_message(filters.me & filters.command("ping", prefixes="/"))
 async def ping_cmd(_, msg: Message):
     await msg.reply_text("pong ✅")
@@ -257,7 +315,8 @@ async def whoami_cmd(client: Client, msg: Message):
         f"👤 **Logged in as**\n"
         f"- id: `{me.id}`\n"
         f"- username: @{me.username if me.username else '(none)'}\n"
-        f"- first_name: {me.first_name}"
+        f"- first_name: {me.first_name}\n"
+        f"- storage: `{STORAGE}`"
     )
 
 @app.on_message(filters.me & filters.command("help", prefixes="/"))
@@ -265,7 +324,7 @@ async def help_cmd(_, msg: Message):
     text = (
         "**Perintah (Auto-Verify & Anti-Flood):**\n\n"
         "🧩 Join (undangan & publik)\n"
-        "  `/join <multi-link atau @user>`  — satu per baris\n\n"
+        "  `/join <multi-link atau @user>` — satu per baris\n\n"
         "🔗 Target Pencarian\n"
         "  `/addlist <link t.me atau keyword>`\n  `/dellist [item]`\n  `/showlist`\n\n"
         "📺 Channel (t.me)\n"
@@ -274,8 +333,8 @@ async def help_cmd(_, msg: Message):
         "🔍 Cek\n"
         "  `/check [limit]` — default 30 pesan per channel\n\n"
         "⚙️ Setting runtime\n"
-        "  `/setdelay <detik>`\n  `/setbatch <jumlah>`\n"
-        "  `/setcooldown <menit>`\n  `/setcaps <hourly> <daily>`\n"
+        "  `/setdelay <detik>`  `/setbatch <jumlah>`  `/setcooldown <menit>`\n"
+        "  `/setcaps <hourly> <daily>`\n"
         "🧪 Debug\n"
         "  `/ping`  `/whoami`\n"
     )
@@ -318,8 +377,7 @@ async def setcaps_cmd(_, msg: Message):
     join_timestamps = deque(maxlen=DAILY_JOIN_CAP * 2)
     await msg.reply_text(f"✅ Caps diset ke hourly={HOURLY_JOIN_CAP}, daily={DAILY_JOIN_CAP}.")
 
-
-# ==================== LIST MANAGEMENT ====================
+# ----- LIST MANAGEMENT -----
 @app.on_message(filters.me & filters.command("addlist", prefixes="/"))
 async def addlist_cmd(_, msg: Message):
     parts = msg.text.split(maxsplit=1)
@@ -347,8 +405,7 @@ async def showlist_cmd(_, msg: Message):
     text = "\n".join(lines) if lines else "(kosong)"
     await msg.reply_text(f"📄 **Daftar Target:**\n{text}", disable_web_page_preview=True)
 
-
-# ==================== CHANNEL MANAGEMENT (auto-fix + auto-verify subset) ====================
+# ----- CHANNEL MANAGEMENT -----
 @app.on_message(filters.me & filters.command("addchan", prefixes="/"))
 async def addchan_cmd(client: Client, msg: Message):
     parts = msg.text.split(maxsplit=1)
@@ -396,8 +453,7 @@ async def showchan_cmd(_, msg: Message):
     text = "\n".join(chans) if chans else "(kosong)"
     await msg.reply_text(f"📺 **Daftar Channel (t.me):**\n{text}", disable_web_page_preview=True)
 
-
-# ==================== CORE VERIFY (dipakai /verifychan dan auto-verify) ====================
+# ----- VERIFY CORE -----
 async def verify_links(client: Client, links: List[str], parent_msg: Message):
     global adaptive_delay
     cache = load_cache()
@@ -471,8 +527,7 @@ async def verifychan_cmd(client: Client, msg: Message):
         await msg.reply_text("Tidak ada channel di daftar."); return
     await verify_links(client, chans, msg)
 
-
-# ==================== JOIN handler (invite + public) ====================
+# ----- JOIN -----
 @app.on_message(filters.me & filters.command("join", prefixes="/"))
 async def join_cmd(client: Client, msg: Message):
     global adaptive_delay
@@ -569,8 +624,7 @@ async def join_cmd(client: Client, msg: Message):
     if failed:  report += "\n\n**Gagal/Skip (sample):**\n" + "\n".join(failed[:30])
     await update_status(status, report)
 
-
-# ==================== CHECK handler (supports /check [limit]) ====================
+# ----- CHECK -----
 @app.on_message(filters.me & filters.command("check", prefixes="/"))
 async def check_cmd(client: Client, msg: Message):
     parts = msg.text.split(maxsplit=1)
@@ -650,10 +704,8 @@ async def check_cmd(client: Client, msg: Message):
     head = f"✅ **Selesai!**\nChannel dicek: {processed}\nKetemu: {found}\n\n"
     await update_status(status, head + ("\n".join(lines[:200]) + (f"\n…({len(lines)-200} lagi)" if len(lines) > 200 else "")))
 
-
-# ==================== helper: ensure join if needed (used by /check) ====================
+# ----- helper for /check -----
 async def ensure_join_if_needed(client: Client, link: str, cache: Dict[str, dict]):
-    """Jika link adalah undangan dan belum tercache, coba join dengan hormat."""
     global adaptive_delay
     link_n = normalize_tme_link(link)
     if not is_invite_link(link_n): return
@@ -679,8 +731,7 @@ async def ensure_join_if_needed(client: Client, link: str, cache: Dict[str, dict
     except Exception:
         pass
 
-
 # ==================== STARTUP ====================
 if __name__ == "__main__":
-    print("🚀 Userbot siap. (SESSION_STRING mode)" if SESSION_STRING else "🚀 Userbot siap. (PHONE mode)")
+    print(f"🚀 Userbot siap. (SESSION_STRING mode: {'yes' if SESSION_STRING else 'no'}) | storage={STORAGE}")
     app.run()
