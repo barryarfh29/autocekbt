@@ -52,15 +52,15 @@ LINK_FILE    = _p("links.txt")
 CACHE_FILE   = _p("channels_cache.json")
 
 # Anti Flood (bisa diubah runtime via commands)
-JOIN_DELAY = 12
-BATCH_SIZE = 6
-BATCH_COOLDOWN = 25 * 60
-CHECK_LIMIT = 30
+JOIN_DELAY = 40
+BATCH_SIZE = 11
+BATCH_COOLDOWN = 30 * 60
+CHECK_LIMIT = 15
 STATUS_INTERVAL = 5
 HOURLY_JOIN_CAP = 8
 DAILY_JOIN_CAP = 40
 FLOOD_ABORT_SECONDS = 600
-MAX_AUTOVERIFY_PER_ADD = 6
+MAX_AUTOVERIFY_PER_ADD = 11
 
 adaptive_delay = JOIN_DELAY
 join_timestamps = deque(maxlen=DAILY_JOIN_CAP * 2)
