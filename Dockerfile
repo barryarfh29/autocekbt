@@ -1,21 +1,21 @@
 FROM python:3.11-slim
 
-# (opsional) user non-root
 RUN useradd -m appuser
 WORKDIR /app
 
-# env untuk python & pip
 ENV PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# install deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy source code
 COPY . .
-RUN chmod +x start.sh
+
+# Siapkan volume data & izin tulis
+RUN mkdir -p /data && chown -R appuser:appuser /data
+RUN chmod -R 755 /data
 
 USER appuser
-CMD ["./start.sh"]
+
+CMD ["python", "-u", "userbot.py"]
