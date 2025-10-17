@@ -12,10 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Siapkan volume data & izin tulis
+# Siapkan direktori data (kalau mode files/volume dipakai)
 RUN mkdir -p /data && chown -R appuser:appuser /data
-RUN chmod -R 755 /data
-
 USER appuser
 
 CMD ["python", "-u", "userbot.py"]
