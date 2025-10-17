@@ -1,24 +1,39 @@
 FROM python:3.11-slim
 
-# Buat user non-root
-RUN useradd -m appuser
-WORKDIR /app
+# --- terima build-args kalau panel masih menyuntik (kita abaikan saja)
+ARG API_ID
+ARG API_HASH
+ARG SESSION_STRING
+ARG STORAGE
+ARG MONGO_URI
+ARG MONGO_DB
+ARG GIT_SHA
+ARG BUILD_TS=now
 
-# Environment Python
+# --- paket yang sering dibutuhkan saat pip install
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
 
-# Copy semua file bot
+# salin requirements lebih dulu agar layer cache efektif
+COPY requirements.txt .
+# pakai prefer-binary + index resmi (kadang panel punya masalah CA)
+RUN python -m pip install --upgrade pip \
+ && pip install --no-cache-dir --prefer-binary -i https://pypi.org/simple -r requirements.txt
+
+# baru salin source
 COPY . .
 
-# Siapkan direktori data (kalau pakai mode file)
-RUN mkdir -p /data && chown -R appuser:appuser /data
-USER appuser
+# direktori data (untuk mode files + volume)
+RUN mkdir -p /data
 
-# Jalankan bot
 CMD ["python", "-u", "userbot.py"]
